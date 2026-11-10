@@ -1,0 +1,1644 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>班级随机抽人转盘</title>
+<!--
+  ============================================================================
+  班级随机抽人转盘 · 单文件版（离线可用，双击打开即用）
+  ============================================================================
+
+  ① 怎么替换学生名单
+     往下翻到文件末尾 script 标签里的 STUDENTS 数组，按同样格式改就行：
+
+       const STUDENTS = [
+         { seat: 1, name: "张三", avatar: "" },
+         { seat: 2, name: "李四", avatar: "photos/li.png" },
+       ];
+
+     · seat  必须唯一（它同时决定头像文件名，以及"不重复抽取"里标记谁被抽过）
+     · name  随便写，默认头像会取名字的第一个字
+     · avatar 留空  → 自动去 avatars/ 目录找 座号.png / .jpg / .jpeg / .webp
+       avatar 写路径 → 优先用这个路径（同样支持加载失败自动回退）
+
+  ② 怎么放头像文件
+     在本 HTML 同级新建 avatars 文件夹，按"两位座号"命名：
+
+         avatars/01.png   avatars/02.jpg   avatars/03.jpeg   avatars/04.webp
+
+     01~09 记得补零。程序会依次尝试 .png → .jpg → .jpeg → .webp，
+     四种都没有就用"姓名首字 + 按座号生成的稳定底色"的默认头像，
+     任何时候都不会出现裂图。
+
+  ③ 哪些参数可以调
+     全部集中在 <script> 顶部的 CONFIG 常量区：
+     旋转时长、圈数范围、惯性摩擦、结果延迟、历史条数上限、
+     多少人以上只显示座号、字号上下限、转盘配色、localStorage 键名。
+
+  ④ 使用
+     直接双击本文件（file:// 协议）即可，不需要联网、不需要服务器。
+  ============================================================================
+-->
+<style>
+  :root {
+    /* 转盘尺寸：最大不超过 min(90vw, 60vh)，再加 680px 的绝对上限防止超大屏过大 */
+    --wheel: min(90vw, 60vh, 680px);
+    --ink: #22304d;
+    --ink-soft: #6b7893;
+    --line: rgba(34, 48, 77, 0.1);
+    --accent: #f2542d;
+    --radius: 20px;
+    --shadow: 0 10px 30px rgba(36, 60, 110, 0.12);
+    --font: "PingFang SC", "Microsoft YaHei", "Hiragino Sans GB", system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+
+  *, *::before, *::after { box-sizing: border-box; }
+
+  html, body { margin: 0; min-height: 100%; }
+
+  body {
+    font-family: var(--font);
+    color: var(--ink);
+    background:
+      radial-gradient(900px 520px at 12% -8%, #ffe6cf 0%, rgba(255, 230, 207, 0) 62%),
+      radial-gradient(900px 520px at 88% 4%, #d8ecff 0%, rgba(216, 236, 255, 0) 60%),
+      linear-gradient(180deg, #f6faff 0%, #edf2fb 100%);
+    min-height: 100vh;
+    min-height: 100dvh;
+    -webkit-text-size-adjust: 100%;
+    overflow-x: hidden;
+  }
+
+  .app {
+    max-width: 1360px;
+    margin: 0 auto;
+    padding: clamp(10px, 2vw, 24px);
+    display: flex;
+    flex-direction: column;
+    gap: clamp(10px, 1.6vw, 18px);
+    min-height: 100vh;
+    min-height: 100dvh;
+  }
+
+  /* ---------- 顶部标题 ---------- */
+  .topbar {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    flex-wrap: wrap;
+    padding: 0 4px;
+  }
+  .topbar h1 {
+    margin: 0;
+    font-size: clamp(19px, 3.2vw, 30px);
+    letter-spacing: 0.5px;
+    color: #1b2740;
+  }
+  .topbar .sub {
+    color: var(--ink-soft);
+    font-size: clamp(13px, 1.6vw, 16px);
+    font-weight: 600;
+  }
+
+  /* ---------- 主区域：竖屏单列，横屏宽屏双列 ---------- */
+  .stage {
+    display: flex;
+    flex-direction: column;
+    gap: clamp(12px, 2vw, 20px);
+    align-items: stretch;
+    flex: 1 1 auto;
+    min-height: 0;
+  }
+
+  .wheel-area {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: clamp(10px, 2vh, 18px);
+    min-width: 0;
+  }
+
+  /* ---------- 转盘本体 ---------- */
+  .wheel-wrap {
+    position: relative;
+    width: var(--wheel);
+    height: var(--wheel);
+    border-radius: 50%;
+    touch-action: none;              /* 触摸拖动盘面时，绝不触发页面滚动 */
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  #wheel {
+    display: block;
+    width: 100%;
+    height: 100%;
+    border-radius: 50%;
+    cursor: grab;
+    /* 阴影放在 canvas 自身上：形状固定，不会随每帧重绘内容重新计算阴影 */
+    box-shadow: 0 18px 30px rgba(43, 63, 110, 0.18);
+  }
+  .wheel-wrap.dragging #wheel { cursor: grabbing; }
+
+  /* 指针：固定在 12 点方向，不随盘旋转；尖朝下指向盘面 */
+  .pointer {
+    position: absolute;
+    left: 50%;
+    top: calc(var(--wheel) * -0.025);
+    transform: translateX(-50%);
+    width: calc(var(--wheel) * 0.078);
+    height: calc(var(--wheel) * 0.135);
+    background: linear-gradient(180deg, #ff6b52 0%, #d32f2f 100%);
+    -webkit-clip-path: polygon(50% 100%, 0% 0%, 100% 0%);
+    clip-path: polygon(50% 100%, 0% 0%, 100% 0%);
+    filter: drop-shadow(0 3px 5px rgba(0, 0, 0, 0.35));
+    pointer-events: none;
+    z-index: 3;
+  }
+  .pointer::after {
+    /* 指针上的一点点高光，投影下更好看 */
+    content: "";
+    position: absolute;
+    inset: 12% 34% auto 34%;
+    height: 22%;
+    background: rgba(255, 255, 255, 0.45);
+    border-radius: 2px;
+  }
+
+  /* 盘心按钮 */
+  .hub {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    transform: translate(-50%, -50%);
+    width: calc(var(--wheel) * 0.2);
+    height: calc(var(--wheel) * 0.2);
+    border-radius: 50%;
+    border: calc(var(--wheel) * 0.012) solid #fff;
+    background: radial-gradient(circle at 50% 35%, #ffffff 0%, #f2f6ff 100%);
+    color: var(--accent);
+    font-family: inherit;
+    font-weight: 800;
+    font-size: calc(var(--wheel) * 0.052);
+    letter-spacing: 1px;
+    line-height: 1;
+    display: grid;
+    place-items: center;
+    cursor: pointer;
+    box-shadow: 0 6px 18px rgba(20, 40, 80, 0.28);
+    touch-action: none;
+    z-index: 2;
+    transition: transform 0.15s ease, box-shadow 0.2s ease;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .hub:active { transform: translate(-50%, -50%) scale(0.95); }
+
+  /* ---------- 控制条 ---------- */
+  .controls {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+
+  .btn {
+    font-family: inherit;
+    font-size: clamp(14px, 1.7vw, 17px);
+    font-weight: 700;
+    border: none;
+    border-radius: 999px;
+    padding: 12px 24px;
+    cursor: pointer;
+    transition: transform 0.12s ease, box-shadow 0.18s ease, background 0.18s ease, color 0.18s ease;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .btn:active { transform: scale(0.97); }
+  .btn:disabled { opacity: 0.55; cursor: not-allowed; transform: none; }
+
+  .btn-primary {
+    color: #fff;
+    background: linear-gradient(180deg, #ff8256 0%, var(--accent) 100%);
+    box-shadow: 0 8px 20px rgba(242, 84, 45, 0.32);
+  }
+  .btn-primary:hover:not(:disabled) { box-shadow: 0 10px 26px rgba(242, 84, 45, 0.42); }
+
+  .btn-ghost {
+    background: #fff;
+    color: var(--ink);
+    box-shadow: 0 4px 14px rgba(36, 60, 110, 0.12);
+  }
+
+  .btn-danger {
+    background: #fff2f0;
+    color: #cc3410;
+    box-shadow: 0 3px 10px rgba(204, 52, 16, 0.12);
+    padding: 8px 14px;
+    font-size: 14px;
+  }
+  .btn-danger.armed { background: #cc3410; color: #fff; }
+
+  /* 开关 */
+  .switch {
+    display: inline-flex;
+    align-items: center;
+    gap: 9px;
+    font-size: clamp(14px, 1.6vw, 16px);
+    font-weight: 600;
+    color: var(--ink);
+    background: #fff;
+    padding: 9px 16px 9px 13px;
+    border-radius: 999px;
+    box-shadow: 0 4px 14px rgba(36, 60, 110, 0.1);
+    cursor: pointer;
+    -webkit-user-select: none;
+    user-select: none;
+  }
+  .switch input {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 44px;
+    height: 26px;
+    margin: 0;
+    border-radius: 999px;
+    background: #d7dfec;
+    position: relative;
+    cursor: pointer;
+    transition: background 0.2s ease;
+    flex: 0 0 auto;
+  }
+  .switch input::after {
+    content: "";
+    position: absolute;
+    top: 3px;
+    left: 3px;
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    background: #fff;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
+    transition: transform 0.2s ease;
+  }
+  .switch input:checked { background: #2fa84f; }
+  .switch input:checked::after { transform: translateX(18px); }
+
+  /* ---------- 历史面板 ---------- */
+  .panel {
+    background: rgba(255, 255, 255, 0.88);
+    -webkit-backdrop-filter: blur(10px);
+    backdrop-filter: blur(10px);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    padding: 14px 16px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    min-height: 0;
+    min-width: 0;
+    overflow: hidden;
+  }
+
+  .panel-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+  .panel-head h2 {
+    margin: 0;
+    font-size: clamp(15px, 1.8vw, 18px);
+    color: #1b2740;
+  }
+  .panel-head .count {
+    font-size: 13px;
+    color: var(--ink-soft);
+    font-weight: 600;
+  }
+  .panel-head .spacer { flex: 1 1 auto; }
+
+  .history {
+    list-style: none;
+    margin: 0;
+    padding: 2px 2px 2px 0;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    overflow-y: auto;
+    overscroll-behavior: contain;    /* 历史区自己滚动，不带动整页 */
+    max-height: 38vh;
+    scrollbar-width: thin;
+  }
+  .history::-webkit-scrollbar { width: 8px; }
+  .history::-webkit-scrollbar-thumb {
+    background: rgba(34, 48, 77, 0.18);
+    border-radius: 999px;
+  }
+
+  .history li {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    padding: 7px 10px;
+    border-radius: 14px;
+    background: #fff;
+    box-shadow: 0 2px 8px rgba(36, 60, 110, 0.07);
+    animation: slideIn 0.22s ease both;
+    flex: 0 0 auto;
+  }
+  .history li .seq {
+    width: 26px;
+    height: 26px;
+    flex: 0 0 auto;
+    border-radius: 50%;
+    background: #eef3fb;
+    color: #55627d;
+    font-size: 12px;
+    font-weight: 800;
+    display: grid;
+    place-items: center;
+  }
+  .history li .avatar {
+    width: 30px;
+    height: 30px;
+    flex: 0 0 auto;
+    border-radius: 50%;
+    object-fit: cover;
+    background: #eef3fb;
+  }
+  .history li .who {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    flex: 1 1 auto;
+    gap: 1px;
+  }
+  .history li .who b {
+    font-size: 15px;
+    color: #1b2740;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .history li .who span {
+    font-size: 12px;
+    color: var(--ink-soft);
+    font-variant-numeric: tabular-nums;
+  }
+  .history li .seatTag {
+    flex: 0 0 auto;
+    font-size: 12px;
+    font-weight: 800;
+    color: var(--accent);
+    background: #fff1eb;
+    padding: 3px 8px;
+    border-radius: 999px;
+  }
+
+  .empty {
+    margin: auto 0;
+    padding: 16px 4px;
+    text-align: center;
+    color: var(--ink-soft);
+    font-size: 14px;
+  }
+
+  @keyframes slideIn {
+    from { opacity: 0; transform: translateY(-6px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+
+  /* ---------- 全屏结果层 ---------- */
+  .result {
+    position: fixed;
+    inset: 0;
+    z-index: 60;
+    display: grid;
+    place-items: center;
+    padding: 20px;
+    background: radial-gradient(circle at 50% 40%, rgba(28, 38, 66, 0.52), rgba(12, 18, 34, 0.8));
+    -webkit-backdrop-filter: blur(16px) saturate(1.15);
+    backdrop-filter: blur(16px) saturate(1.15);
+    opacity: 0;
+    visibility: hidden;
+    transition: opacity 0.22s ease, visibility 0s linear 0.22s;
+    cursor: pointer;
+  }
+  .result.show {
+    opacity: 1;
+    visibility: visible;
+    transition: opacity 0.22s ease;
+  }
+
+  .result-card {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 10px;
+    text-align: center;
+    transform: scale(0.86);
+    opacity: 0.4;
+    transition: transform 0.3s cubic-bezier(0.18, 1.3, 0.4, 1), opacity 0.25s ease;
+    cursor: default;
+  }
+  .result.show .result-card { transform: scale(1); opacity: 1; }
+
+  .result-avatar {
+    width: clamp(118px, 19vmin, 190px);
+    height: clamp(118px, 19vmin, 190px);
+    border-radius: 50%;
+    overflow: hidden;
+    background: #fff;
+    box-shadow: 0 0 0 6px rgba(255, 255, 255, 0.92), 0 18px 44px rgba(0, 0, 0, 0.42);
+  }
+  .result-avatar img { width: 100%; height: 100%; object-fit: cover; display: block; }
+
+  .result-seat {
+    font-size: clamp(64px, 15vmin, 146px);
+    font-weight: 900;
+    line-height: 1;
+    letter-spacing: 2px;
+    color: #ffd166;
+    text-shadow: 0 6px 30px rgba(255, 209, 102, 0.35);
+    font-variant-numeric: tabular-nums;
+  }
+  .result-name {
+    font-size: clamp(30px, 7vmin, 64px);
+    font-weight: 800;
+    color: #fff;
+    text-shadow: 0 4px 18px rgba(0, 0, 0, 0.35);
+    word-break: break-word;
+  }
+  .result-hint {
+    margin: 4px 0 2px;
+    font-size: 13px;
+    color: rgba(255, 255, 255, 0.62);
+  }
+  .result .btn-primary { padding: 10px 26px; }
+
+  /* ---------- 轻提示 ---------- */
+  .toast {
+    position: fixed;
+    left: 50%;
+    bottom: 12vh;
+    transform: translate(-50%, 12px);
+    background: rgba(24, 32, 54, 0.92);
+    color: #fff;
+    padding: 11px 20px;
+    border-radius: 999px;
+    font-size: 15px;
+    font-weight: 600;
+    max-width: 86vw;
+    text-align: center;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.2s ease, transform 0.2s ease;
+    z-index: 70;
+  }
+  .toast.show { opacity: 1; transform: translate(-50%, 0); }
+
+  /* ---------- 横屏 / 宽屏：左盘右史 ---------- */
+  @media (min-width: 900px) and (orientation: landscape) {
+    .stage { flex-direction: row; align-items: stretch; }
+    .wheel-area { flex: 1 1 auto; justify-content: center; }
+    /* 给面板一个视口上限，否则历史条数一多会把整页撑长、"限高滚动"失效 */
+    .panel {
+      flex: 0 0 clamp(300px, 32vw, 400px);
+      max-height: calc(100vh - 130px);
+      max-height: calc(100dvh - 130px);
+    }
+    .history { max-height: none; flex: 1 1 auto; min-height: 0; }
+  }
+
+  @media (max-height: 560px) {
+    :root { --wheel: min(90vw, 62vh, 680px); }
+    .topbar { display: none; }
+  }
+</style>
+</head>
+<body>
+
+<div class="app">
+  <header class="topbar">
+    <h1>🎯 班级随机抽人</h1>
+    <span class="sub" id="stat">—</span>
+  </header>
+
+  <main class="stage">
+    <section class="wheel-area">
+      <div class="wheel-wrap" id="wheelWrap">
+        <div class="pointer" aria-hidden="true"></div>
+        <canvas id="wheel"></canvas>
+        <button class="hub" id="hubBtn" type="button">开始</button>
+      </div>
+
+      <div class="controls">
+        <button class="btn btn-primary" id="spinBtn" type="button">开始抽取</button>
+        <label class="switch">
+          <input type="checkbox" id="noRepeat">
+          <span>不重复抽取</span>
+        </label>
+        <button class="btn btn-ghost" id="resetBtn" type="button" hidden>重置本轮</button>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>抽选历史</h2>
+        <span class="count" id="histCount">0 条</span>
+        <span class="spacer"></span>
+        <button class="btn btn-danger" id="clearBtn" type="button">清空历史</button>
+      </div>
+      <ul class="history" id="historyList"></ul>
+      <p class="empty" id="histEmpty">还没有抽选记录，转一下试试吧。</p>
+    </section>
+  </main>
+</div>
+
+<!-- 全屏结果层 -->
+<div class="result" id="resultLayer" role="dialog" aria-modal="true" aria-label="抽选结果">
+  <div class="result-card">
+    <div class="result-avatar"><img id="resultAvatar" alt=""></div>
+    <div class="result-seat" id="resultSeat">--</div>
+    <div class="result-name" id="resultName">--</div>
+    <p class="result-hint">点击任意位置关闭</p>
+    <button class="btn btn-primary" id="resultClose" type="button">关闭</button>
+  </div>
+</div>
+
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+<script>
+(function () {
+  'use strict';
+
+  /* ==========================================================================
+     1. 学生名单 —— 改这里就行
+     ========================================================================== */
+  const STUDENTS = [
+    { seat:  1, name: "陈锴漩", avatar: "" },
+    { seat:  2, name: "陈臻兴", avatar: "" },
+    { seat:  3, name: "叶宇恒", avatar: "" },
+    { seat:  4, name: "曾嘉昕", avatar: "" },
+    { seat:  5, name: "包韩", avatar: "" },
+    { seat:  6, name: "林源特", avatar: "" },
+    { seat:  7, name: "卞浩然", avatar: "" },
+    { seat:  8, name: "叶钰鑫", avatar: "" },
+    { seat:  9, name: "余涵", avatar: "" },
+    { seat: 10, name: "鄢子悦", avatar: "" },
+    { seat: 11, name: "顾缃", avatar: "" },
+    { seat: 12, name: "王柳馨", avatar: "" },
+    { seat: 13, name: "郑栩", avatar: "" },
+    { seat: 14, name: "张雨豪", avatar: "" },
+    { seat: 15, name: "陈天阳", avatar: "" },
+    { seat: 16, name: "刘晨", avatar: "" },
+    { seat: 17, name: "王梦琳", avatar: "" },
+    { seat: 18, name: "徐睿", avatar: "" },
+    { seat: 19, name: "王鸿晔", avatar: "" },
+    { seat: 20, name: "杨芯", avatar: "" },
+    { seat: 21, name: "肖镔函", avatar: "" },
+    { seat: 22, name: "熊雨涵", avatar: "" },
+    { seat: 23, name: "黄芃", avatar: "" },
+    { seat: 24, name: "薛奕程", avatar: "" },
+    { seat: 25, name: "高哲宣", avatar: "" },
+    { seat: 26, name: "刘筱宸", avatar: "" },
+    { seat: 27, name: "葛豪杰", avatar: "" },
+    { seat: 28, name: "郑翊", avatar: "" },
+    { seat: 29, name: "欧馨茹", avatar: "" },
+    { seat: 30, name: "张梓恒", avatar: "" },
+    { seat: 31, name: "秦姚", avatar: "" },
+    { seat: 32, name: "刘涵蓓", avatar: "" },
+    { seat: 33, name: "官子芃", avatar: "" },
+    { seat: 34, name: "黄钧炜", avatar: "" },
+    { seat: 35, name: "郑煜菲", avatar: "" },
+    { seat: 36, name: "吴若瑜", avatar: "" },
+    { seat: 37, name: "陈矩文", avatar: "" },
+    { seat: 38, name: "谢阳熠", avatar: "" },
+    { seat: 39, name: "姚昕宸", avatar: "" },
+    { seat: 40, name: "汤振南", avatar: "" },
+    { seat: 41, name: "何昊辰", avatar: "" },
+    { seat: 42, name: "郑诗煊", avatar: "" },
+    { seat: 43, name: "林思琪", avatar: "" },
+    { seat: 44, name: "俞伟伦", avatar: "" },
+    { seat: 45, name: "胡传睿", avatar: "" },
+    { seat: 46, name: "李景铭", avatar: "" },
+    { seat: 47, name: "陈至荣", avatar: "" },
+    { seat: 48, name: "王启晟", avatar: "" },
+    { seat: 49, name: "陈诺", avatar: "" },
+    { seat: 50, name: "许艳桢", avatar: "" },
+    { seat: 51, name: "黄奕煊", avatar: "" },
+    { seat: 52, name: "章荷娇", avatar: "" },
+    { seat: 53, name: "林海彬", avatar: "" },
+    { seat: 54, name: "吴瑞杰", avatar: "" },
+    { seat: 55, name: "杨绍彬", avatar: "" },
+    { seat: 56, name: "曾星颖", avatar: "" },
+    { seat: 57, name: "邱子昂", avatar: "" },
+    { seat: 58, name: "林乐言", avatar: "" },
+    { seat: 59, name: "林芷怡", avatar: "" }
+  ];
+
+  /* ==========================================================================
+     2. 可调参数 —— 全部集中在这里
+     ========================================================================== */
+  const CONFIG = {
+    // —— 旋转动画 ——
+    spinMinDuration: 3200,      // 点击旋转最短时长（毫秒）
+    spinMaxDuration: 4800,      // 点击旋转最长时长（毫秒），实际在 3.2~4.8s 之间随机
+    spinMinTurns: 4,            // 最少转几圈
+    spinMaxTurns: 8,            // 最多转几圈（会再叠加随机小数圈，保证落点随机）
+
+    // —— 拖动惯性 ——
+    inertiaFriction: 3.2,       // 惯性摩擦系数 k，越大停得越快
+    stopSpeed: 0.05,            // 角速度低于该值（rad/s）判定为已停
+    maxFlingSpeed: 35,          // 松手末速度上限（rad/s），防止过于夸张
+    minFlingSpeed: 0.8,         // 末速度低于该值视为"轻放"，直接停
+    dragSampleMs: 120,          // 计算末速度时回看的时间窗口（毫秒）
+
+    // —— 点击 / 拖动判别 ——
+    tapMaxMovePx: 8,            // 位移小于 8px 才算点击
+    tapMaxAngle: 0.02,          // 且累计旋转角小于 0.02rad 才算点击
+    tapMaxMs: 400,              // 且按住时间小于 400ms 才算点击
+
+    // —— 结果 ——
+    resultDelay: 300,           // 停下后延迟多少毫秒弹出结果层
+    resultClickGuardMs: 260,    // 结果层刚出现时忽略点击，防误触
+
+    // —— 历史 ——
+    maxHistory: 100,            // 历史最多保留多少条
+
+    // —— 扇区文字 ——
+    denseThreshold: 40,         // 人数 > 40 时扇区里只显示座号
+    fontSizeMax: 24,            // 扇区文字最大字号（px）
+    fontSizeMin: 8,             // 扇区文字最小字号（px）
+
+    // —— 转盘外观 ——
+    wheelColors: ["#ff8a65", "#4fc3f7", "#ffd166"],  // 前两个交替；奇数人时最后一格用第三个
+    hubRatio: 0.22,             // 盘心按钮半径占转盘半径的比例（给文字留出的空白）
+
+    // —— 头像 ——
+    avatarDir: "avatars/",                  // 头像目录
+    avatarExts: ["png", "jpg", "jpeg", "webp"], // 依次尝试的扩展名
+    seatDigits: 2,                          // 头像文件名里座号补几位
+
+    // —— 本地存储键名 ——
+    storageKeys: {
+      history: "class-wheel.history.v1",
+      drawn: "class-wheel.drawn.v1",
+      picks: "class-wheel.picks.v1",
+      noRepeat: "class-wheel.norepeat.v1",
+      roundBase: "class-wheel.roundbase.v1"
+    }
+  };
+
+  /* ==========================================================================
+     3. 常量与工具
+     ========================================================================== */
+  const TAU = Math.PI * 2;
+  const FONT_STACK = '"PingFang SC","Microsoft YaHei","Hiragino Sans GB",system-ui,-apple-system,"Segoe UI",sans-serif';
+  // 指针固定在 12 点方向，在 canvas 角度系（0=3点方向、顺时针增大）里就是 -π/2
+  const POINTER_ANGLE = -Math.PI / 2;
+
+  const $ = id => document.getElementById(id);
+  const els = {
+    wrap: $("wheelWrap"),
+    canvas: $("wheel"),
+    hub: $("hubBtn"),
+    spin: $("spinBtn"),
+    reset: $("resetBtn"),
+    noRepeat: $("noRepeat"),
+    stat: $("stat"),
+    historyList: $("historyList"),
+    histEmpty: $("histEmpty"),
+    histCount: $("histCount"),
+    clear: $("clearBtn"),
+    result: $("resultLayer"),
+    resultAvatar: $("resultAvatar"),
+    resultSeat: $("resultSeat"),
+    resultName: $("resultName"),
+    resultClose: $("resultClose"),
+    toast: $("toast")
+  };
+
+  const ctx = els.canvas.getContext("2d");
+
+  /** 把任意角度归一化到 [0, 2π) */
+  function normalizeAngle(a) {
+    a %= TAU;
+    return a < 0 ? a + TAU : a;
+  }
+
+  function pad2(n) {
+    return String(n).padStart(2, "0");
+  }
+
+  /** 座号按固定位数补零，用来拼头像文件名 */
+  function padSeat(seat) {
+    return String(seat).padStart(CONFIG.seatDigits, "0");
+  }
+
+  function randInt(min, max) {
+    return Math.floor(Math.random() * (max - min + 1)) + min;
+  }
+
+  /** 由座号生成稳定的哈希值 —— 保证同一个学生每次刷新默认头像颜色一致 */
+  function hashSeat(seat) {
+    const s = String(seat);
+    let h = 2166136261;
+    for (let i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    return h >>> 0;
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, function (ch) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch];
+    });
+  }
+
+  function studentBySeat(seat) {
+    for (let i = 0; i < STUDENTS.length; i++) {
+      if (STUDENTS[i].seat === seat) return STUDENTS[i];
+    }
+    return null;
+  }
+
+  function labelFont(size) {
+    return "700 " + size + "px " + FONT_STACK;
+  }
+
+  /* ==========================================================================
+     4. 状态
+     ========================================================================== */
+  let wheelAngle = 0;          // 转盘当前旋转角（弧度，顺时针为正）—— 渲染与判定的唯一真相
+  let state = "idle";          // idle | dragging | spinning | inertia | pending | result
+  let wheelSize = 0;           // canvas 的 CSS 像素尺寸
+  let dpr = 1;
+  let wheelBitmap = null;      // 预渲染好的转盘位图（未旋转状态），每帧只做一次旋转绘制
+  let spin = null;             // 点击旋转的动画参数
+  let inertia = null;          // 拖拽惯性的动画参数
+  let drag = null;             // 当前拖动会话
+  let rafId = 0;
+  let pendingTimer = 0;
+  let lastLayoutKey = "";
+  let wheelRectCache = null;   // 拖动期间缓存 boundingClientRect，避免每帧强制重排
+
+  let records = [];            // 抽选历史，最新在最前
+  let drawnSeats = [];         // "不重复抽取"已抽中的座号
+  let picks = 0;               // 累计抽选次数（给历史里的序号用）
+  let noRepeat = false;
+  let roundBaseSeq = 0;        // "本轮"的起点序号：大于它的历史才算进本轮已抽
+
+  const avatarSrc = new Map(); // seat -> 可用的图片地址（默认头像 dataURL 或探测到的文件路径）
+
+  /* ==========================================================================
+     5. 本地存储
+     ========================================================================== */
+  function readJSON(key, fallback) {
+    try {
+      const raw = localStorage.getItem(key);
+      if (raw === null || raw === undefined) return fallback;
+      const val = JSON.parse(raw);
+      return (val === null || val === undefined) ? fallback : val;
+    } catch (err) {
+      return fallback;   // 某些浏览器在 file:// 下禁用 localStorage，直接降级为内存态
+    }
+  }
+
+  function writeJSON(key, value) {
+    try {
+      localStorage.setItem(key, JSON.stringify(value));
+    } catch (err) {
+      /* 存不进去就算了，页面本次会话照常工作 */
+    }
+  }
+
+  function persist() {
+    writeJSON(CONFIG.storageKeys.history, records);
+    writeJSON(CONFIG.storageKeys.drawn, drawnSeats);
+    writeJSON(CONFIG.storageKeys.picks, picks);
+    writeJSON(CONFIG.storageKeys.noRepeat, noRepeat);
+    writeJSON(CONFIG.storageKeys.roundBase, roundBaseSeq);
+  }
+
+  function loadState() {
+    records = readJSON(CONFIG.storageKeys.history, []);
+    drawnSeats = readJSON(CONFIG.storageKeys.drawn, []);
+    picks = readJSON(CONFIG.storageKeys.picks, 0);
+    noRepeat = readJSON(CONFIG.storageKeys.noRepeat, false) === true;
+    roundBaseSeq = readJSON(CONFIG.storageKeys.roundBase, 0);
+
+    if (!Array.isArray(records)) records = [];
+    if (!Array.isArray(drawnSeats)) drawnSeats = [];
+    if (typeof picks !== "number" || !isFinite(picks)) picks = 0;
+    if (typeof roundBaseSeq !== "number" || !isFinite(roundBaseSeq)) roundBaseSeq = 0;
+
+    // 名单可能被改过：把已经不存在的学生从历史和已抽集合里清掉，避免脏数据
+    const seats = new Set(STUDENTS.map(function (s) { return s.seat; }));
+    records = records.filter(function (r) {
+      return r && typeof r.seat !== "undefined" && seats.has(r.seat);
+    }).slice(0, CONFIG.maxHistory);
+    drawnSeats = drawnSeats.filter(function (seat) { return seats.has(seat); });
+  }
+
+  /* ==========================================================================
+     6. 头像：默认头像（Canvas 自绘）+ 多扩展名探测
+     ========================================================================== */
+
+  /** 默认头像：姓名首字 + 按座号稳定生成的渐变底色，画成圆形并转成 dataURL */
+  function makeDefaultAvatar(student) {
+    const size = 160;
+    const c = document.createElement("canvas");
+    c.width = size;
+    c.height = size;
+    const g = c.getContext("2d");
+
+    const hue = hashSeat(student.seat) % 360;
+    const grad = g.createLinearGradient(0, 0, size, size);
+    grad.addColorStop(0, "hsl(" + hue + ", 72%, 62%)");
+    grad.addColorStop(1, "hsl(" + ((hue + 30) % 360) + ", 68%, 46%)");
+    g.fillStyle = grad;
+    g.beginPath();
+    g.arc(size / 2, size / 2, size / 2, 0, TAU);
+    g.fill();
+
+    // 取名字的第一个字符（用 spread 正确处理 emoji / 代理对）
+    const chars = Array.from(String(student.name || "?"));
+    const initial = chars.length ? chars[0] : "?";
+    g.fillStyle = "#ffffff";
+    g.font = "700 " + Math.round(size * 0.46) + "px " + FONT_STACK;
+    g.textAlign = "center";
+    g.textBaseline = "middle";
+    g.fillText(initial, size / 2, size / 2 + size * 0.03);
+
+    try {
+      return c.toDataURL("image/png");
+    } catch (err) {
+      return "";
+    }
+  }
+
+  /** 单个 URL 能不能加载成功 */
+  function canLoad(url) {
+    return new Promise(function (resolve) {
+      const img = new Image();
+      img.onload = function () {
+        resolve(img.naturalWidth > 0);
+      };
+      img.onerror = function () {
+        resolve(false);
+      };
+      img.src = url;
+    });
+  }
+
+  /** 依次尝试 avatar 字段 + 4 种扩展名，全失败返回空串 */
+  async function probeAvatar(student) {
+    const candidates = [];
+    if (student.avatar && String(student.avatar).trim()) {
+      candidates.push(String(student.avatar).trim());
+    }
+    const base = CONFIG.avatarDir + padSeat(student.seat);
+    CONFIG.avatarExts.forEach(function (ext) {
+      candidates.push(base + "." + ext);
+    });
+
+    const uniq = Array.from(new Set(candidates));
+    for (let i = 0; i < uniq.length; i++) {
+      if (await canLoad(uniq[i])) return uniq[i];
+    }
+    return "";
+  }
+
+  /** 初始化：先给所有人铺上默认头像（同步可用，永不裂图），再异步探测真实文件 */
+  function initAvatars() {
+    STUDENTS.forEach(function (st) {
+      avatarSrc.set(st.seat, makeDefaultAvatar(st));
+    });
+    STUDENTS.forEach(function (st) {
+      probeAvatar(st).then(function (url) {
+        if (!url) return;
+        avatarSrc.set(st.seat, url);
+        refreshAvatarImgs(st.seat);
+      });
+    });
+  }
+
+  /** 探测成功后，把页面上这个学生的所有 <img> 换成真实头像 */
+  function refreshAvatarImgs(seat) {
+    const url = avatarSrc.get(seat);
+    if (!url) return;
+    const nodes = document.querySelectorAll('img[data-avatar-seat="' + seat + '"]');
+    for (let i = 0; i < nodes.length; i++) {
+      if (nodes[i].getAttribute("src") !== url) nodes[i].setAttribute("src", url);
+    }
+  }
+
+  /* ==========================================================================
+     7. 参与抽取的人池
+     ========================================================================== */
+  function getPool() {
+    if (!noRepeat) return STUDENTS;
+    const drawnSet = new Set(drawnSeats);
+    return STUDENTS.filter(function (st) { return !drawnSet.has(st.seat); });
+  }
+
+  /* ==========================================================================
+     8. 转盘渲染
+     ========================================================================== */
+
+  /** 扇区配色：相邻交替；人数为奇数时最后一格改用第三色，避免首尾同色 */
+  function pickColor(i, n) {
+    const colors = CONFIG.wheelColors;
+    if (n > 1 && n % 2 === 1 && i === n - 1) {
+      return colors[2] || colors[1] || colors[0];
+    }
+    return colors[i % 2];
+  }
+
+  /** 在扇区里沿半径方向写字，字号在"弧长"和"径向长度"两个约束下自适应 */
+  function drawLabels(g, pool, seg, R, cx, cy, size) {
+    const n = pool.length;
+    const dense = n > CONFIG.denseThreshold;   // 人太多时只显示座号
+    const hubR = R * CONFIG.hubRatio;
+    const outer = R - Math.max(6, size * 0.022);
+    const avail = Math.max(20, outer - hubR - 4);   // 文字可用的径向长度
+
+    for (let i = 0; i < n; i++) {
+      const mid = (i + 0.5) * seg;   // 该扇区的中心角（bitmap 处于 0 旋转状态）
+      const label = dense
+        ? String(pool[i].seat)
+        : String(pool[i].seat) + " " + pool[i].name;
+
+      // ① 弧长约束：在 0.45R 处，扇区宽度决定文字最大高度，避免相邻扇区文字挤在一起
+      const arcAt = R * 0.45 * seg;
+      let fs = Math.min(CONFIG.fontSizeMax, Math.max(CONFIG.fontSizeMin, arcAt * 0.82));
+
+      // ② 径向长度约束：名字太长就往小缩
+      g.font = labelFont(fs);
+      let textW = g.measureText(label).width;
+      let guard = 80;
+      while (textW > avail && fs > CONFIG.fontSizeMin && guard-- > 0) {
+        fs -= 1;
+        g.font = labelFont(fs);
+        textW = g.measureText(label).width;
+      }
+
+      // ③ 沿半径方向排布：先转到扇区中心角，再让文字沿 X 轴（即半径方向）书写。
+      //    盘面左半边（mid 落在 90°~270°）如果不翻转，字会是倒的，所以整格再转 180°，
+      //    锚点跟着换到另一侧，保证每一格都能"正着读"。
+      const flip = mid > Math.PI / 2 && mid < Math.PI * 1.5;
+
+      g.save();
+      g.translate(cx, cy);
+      g.rotate(flip ? mid + Math.PI : mid);
+      g.textAlign = flip ? "left" : "right";   // 文字始终从外沿朝圆心方向延伸
+      g.textBaseline = "middle";
+      g.font = labelFont(fs);
+      g.lineJoin = "round";
+      g.miterLimit = 2;
+      g.lineWidth = Math.max(2, fs * 0.12);
+      g.strokeStyle = "rgba(45, 35, 25, 0.38)";
+      const anchor = flip ? -outer : outer;
+      g.strokeText(label, anchor, 0);
+      g.fillStyle = "#ffffff";
+      g.fillText(label, anchor, 0);
+      g.restore();
+    }
+  }
+
+  /** 预渲染整块转盘（0 角度），旋转时只需要 drawImage 一次，性能更好 */
+  function buildBitmap() {
+    const size = wheelSize;
+    if (!size) return;
+
+    const c = document.createElement("canvas");
+    c.width = Math.max(1, Math.round(size * dpr));
+    c.height = Math.max(1, Math.round(size * dpr));
+    const g = c.getContext("2d");
+    g.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    const cx = size / 2;
+    const cy = size / 2;
+    const R = size / 2 - Math.max(3, size * 0.012);
+    const pool = getPool();
+    const n = pool.length;
+
+    // 底盘
+    g.beginPath();
+    g.arc(cx, cy, R, 0, TAU);
+    g.fillStyle = n === 0 ? "#dfe6f2" : "#ffffff";
+    g.fill();
+
+    if (n === 0) {
+      // 空盘：只用颜色和中心按钮表达"抽完了"，文字提示交给外面
+      wheelBitmap = c;
+      return;
+    }
+
+    const seg = TAU / n;
+    for (let i = 0; i < n; i++) {
+      const a0 = i * seg;
+      const a1 = a0 + seg;
+      g.beginPath();
+      g.moveTo(cx, cy);
+      g.arc(cx, cy, R, a0, a1);
+      g.closePath();
+      g.fillStyle = pickColor(i, n);
+      g.fill();
+      g.strokeStyle = "rgba(255, 255, 255, 0.92)";
+      g.lineWidth = Math.max(1.2, size * 0.005);
+      g.stroke();
+    }
+
+    drawLabels(g, pool, seg, R, cx, cy, size);
+
+    // 外圈描边
+    g.beginPath();
+    g.arc(cx, cy, R - Math.max(1, size * 0.004), 0, TAU);
+    g.strokeStyle = "rgba(34, 48, 77, 0.16)";
+    g.lineWidth = Math.max(2, size * 0.008);
+    g.stroke();
+
+    wheelBitmap = c;
+  }
+
+  /** 每帧绘制：把位图按当前角度转一下画出来 */
+  function paint() {
+    if (!wheelSize || !wheelBitmap) return;
+    const s = wheelSize;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, s, s);
+    ctx.save();
+    ctx.translate(s / 2, s / 2);
+    ctx.rotate(wheelAngle);
+    ctx.drawImage(wheelBitmap, -s / 2, -s / 2, s, s);
+    ctx.restore();
+  }
+
+  /** 尺寸 / 像素比变化时重算 canvas */
+  function layoutCanvas() {
+    const rect = els.canvas.getBoundingClientRect();
+    const size = Math.round(rect.width);
+    if (!size) return;
+
+    const nextDpr = Math.min(2.5, window.devicePixelRatio || 1);
+    const key = size + "x" + nextDpr;
+    if (key === lastLayoutKey) return;
+    lastLayoutKey = key;
+
+    wheelSize = size;
+    dpr = nextDpr;
+    els.canvas.width = Math.round(size * dpr);
+    els.canvas.height = Math.round(size * dpr);
+    buildBitmap();
+    paint();
+  }
+
+  /* ==========================================================================
+     9. 指针命中判定（核心）
+     --------------------------------------------------------------------------
+     约定：
+       · canvas 角度系：0 = 3 点方向，顺时针为正
+       · 扇区 i 在屏幕上占 [wheelAngle + i*seg, wheelAngle + (i+1)*seg)
+       · 指针固定在屏幕 12 点 = -π/2，永远不动
+     因此要判断指针落在哪个扇区，就要把指针角换算回"盘面自身坐标系"：
+       rel = normalize(-π/2 - wheelAngle)
+     再除以扇区宽度取整。全程使用真实渲染角度 wheelAngle，不做任何随机猜测。
+     ========================================================================== */
+  function getIndexAtPointer(angle, count) {
+    if (count <= 0) return -1;
+    if (count === 1) return 0;
+
+    const seg = TAU / count;
+    // 1e-9 rad 的微小偏移：指针恰好压在分割线上时，浮点误差可能把它甩到前一个扇区，
+    // 加上这个偏移后统一归到"分割线顺时针一侧"，保证同一边界每次判定完全一致。
+    const rel = normalizeAngle(POINTER_ANGLE - angle + 1e-9);
+    let idx = Math.floor(rel / seg);
+
+    // 浮点边界兜底：rel 极接近 2π 时可能算出 count
+    if (idx >= count) idx = count - 1;
+    if (idx < 0) idx = 0;
+    return idx;
+  }
+
+  /* ==========================================================================
+     10. 动画循环
+     ========================================================================== */
+  function startLoop() {
+    if (!rafId) rafId = requestAnimationFrame(tick);
+  }
+
+  function tick(now) {
+    rafId = 0;
+    let alive = false;
+
+    if (state === "spinning" && spin) {
+      // 点击旋转：缓动减速（easeOutCubic），末端平顺停下
+      const p = Math.min(1, (now - spin.t0) / spin.duration);
+      const eased = 1 - Math.pow(1 - p, 3);
+      wheelAngle = spin.start + spin.total * eased;
+      paint();
+      if (p < 1) {
+        alive = true;
+      } else {
+        finishSpin();
+      }
+    } else if (state === "inertia" && inertia) {
+      // 拖拽惯性：指数衰减，角度用解析式积分，天然平滑，不会跳帧
+      const k = inertia.k;
+      const t = (now - inertia.t0) / 1000;
+      const speed = Math.abs(inertia.v0) * Math.exp(-k * t);
+      wheelAngle = inertia.start + (inertia.v0 / k) * (1 - Math.exp(-k * t));
+      paint();
+      if (speed > CONFIG.stopSpeed) {
+        alive = true;
+      } else {
+        finishSpin();
+      }
+    }
+
+    if (alive) rafId = requestAnimationFrame(tick);
+  }
+
+  /* ==========================================================================
+     11. 旋转启动
+     ========================================================================== */
+  function requestSpin() {
+    if (state !== "idle") return;          // 转动中 / 结果中禁止重复触发
+
+    const pool = getPool();
+    if (pool.length === 0) {
+      toast("本轮已经全部抽完，点「重置本轮」继续");
+      return;
+    }
+    if (pool.length === 1) {
+      // 只剩一个人也照常转一圈，观感统一
+    }
+
+    // 圈数 + 随机小数圈 → 初速度随机；时长随机 → 3~5 秒内平滑停住
+    const duration = randInt(CONFIG.spinMinDuration, CONFIG.spinMaxDuration);
+    const turns = randInt(CONFIG.spinMinTurns, CONFIG.spinMaxTurns) + Math.random();
+    const total = TAU * turns;
+
+    spin = { start: wheelAngle, total: total, duration: duration, t0: performance.now() };
+    state = "spinning";
+    syncControls();
+    startLoop();
+  }
+
+  /** 停下：用真实角度判定指针所指扇区，然后延迟弹出结果 */
+  function finishSpin() {
+    spin = null;
+    inertia = null;
+
+    const pool = getPool();
+    const idx = getIndexAtPointer(wheelAngle, pool.length);
+    const winner = idx >= 0 ? pool[idx] : null;
+
+    if (!winner) {
+      state = "idle";
+      syncControls();
+      return;
+    }
+
+    state = "pending";
+    recordWin(winner);          // 历史 + 不重复集合（结果层关闭后再重建盘面）
+    syncControls();
+
+    clearTimeout(pendingTimer);
+    pendingTimer = setTimeout(function () {
+      showResult(winner);
+    }, CONFIG.resultDelay);
+  }
+
+  /* ==========================================================================
+     12. 拖动 + 惯性
+     ========================================================================== */
+  /** 从事件里算出"相对盘心"的角度 */
+  function angleFromEvent(e) {
+    const r = wheelRectCache || els.canvas.getBoundingClientRect();
+    const cx = r.left + r.width / 2;
+    const cy = r.top + r.height / 2;
+    return Math.atan2(e.clientY - cy, e.clientX - cx);
+  }
+
+  function onPointerDown(e) {
+    if (state !== "idle") return;
+    if (e.pointerType === "mouse" && e.button !== 0) return;
+    if (getPool().length === 0) {
+      toast("本轮已经全部抽完，点「重置本轮」继续");
+      return;
+    }
+
+    e.preventDefault();
+
+    const rect = els.canvas.getBoundingClientRect();
+    wheelRectCache = rect;
+    const a = Math.atan2(
+      e.clientY - (rect.top + rect.height / 2),
+      e.clientX - (rect.left + rect.width / 2)
+    );
+    const now = performance.now();
+
+    drag = {
+      id: e.pointerId,
+      lastAngle: a,
+      prevAngle: a,                       // 上一次移动时的角度，用来算相邻角度差
+      accumulated: 0,                     // 累计旋转角（用于判别"点击 vs 拖动"）
+      startX: e.clientX,
+      startY: e.clientY,
+      startTime: now,
+      movedByPos: false,
+      samples: [{ t: now, a: wheelAngle }]
+    };
+
+    state = "dragging";
+    els.wrap.classList.add("dragging");
+    try {
+      els.wrap.setPointerCapture(e.pointerId);
+    } catch (err) {
+      /* 个别浏览器不支持指针捕获，用 window 上的监听兜底 */
+    }
+  }
+
+  function onPointerMove(e) {
+    if (!drag || e.pointerId !== drag.id) return;
+    e.preventDefault();
+
+    const now = performance.now();
+    const a = angleFromEvent(e);
+    const r = wheelRectCache || els.canvas.getBoundingClientRect();
+    const cx = r.left + r.width / 2;
+    const cy = r.top + r.height / 2;
+    const dist = Math.hypot(e.clientX - cx, e.clientY - cy);
+
+    // 相邻两次的角度差，归一到 (-π, π]，避免跨 ±π 时跳变
+    let delta = normalizeAngle(a - drag.prevAngle);
+    if (delta > Math.PI) delta -= TAU;
+    drag.prevAngle = a;
+    drag.lastAngle = a;
+
+    // 手指离圆心太近时角度噪音极大，直接忽略这一段（但 prevAngle 已更新，不会积累跳变）
+    if (dist >= Math.max(16, r.width * 0.06) && Math.abs(delta) > 0.0005) {
+      wheelAngle += delta;
+      drag.accumulated += Math.abs(delta);
+      paint();
+    }
+
+    // 位移超过阈值就不算点击了
+    if (Math.hypot(e.clientX - drag.startX, e.clientY - drag.startY) > CONFIG.tapMaxMovePx) {
+      drag.movedByPos = true;
+    }
+
+    // 采样队列只保留最近 dragSampleMs 毫秒，用来算松手瞬间的末速度
+    drag.samples.push({ t: now, a: wheelAngle });
+    const cut = now - CONFIG.dragSampleMs;
+    while (drag.samples.length > 2 && drag.samples[0].t < cut) drag.samples.shift();
+  }
+
+  function onPointerUp(e) {
+    if (!drag || e.pointerId !== drag.id) return;
+    const d = drag;
+    drag = null;
+    wheelRectCache = null;
+    els.wrap.classList.remove("dragging");
+
+    try {
+      els.wrap.releasePointerCapture(d.id);
+    } catch (err) {
+      /* ignore */
+    }
+
+    const heldMs = performance.now() - d.startTime;
+    const isTap = !d.movedByPos
+      && d.accumulated < CONFIG.tapMaxAngle
+      && heldMs < CONFIG.tapMaxMs;
+
+    if (isTap) {
+      // 只是点了一下：走"随机初速度 + 缓动"的正规旋转
+      state = "idle";
+      requestSpin();
+      return;
+    }
+
+    // 算松手瞬间的角速度（rad/s）
+    let v = 0;
+    const s = d.samples;
+    if (s.length >= 2) {
+      const first = s[0];
+      const last = s[s.length - 1];
+      const dt = (last.t - first.t) / 1000;
+      if (dt > 0.004) v = (last.a - first.a) / dt;
+    }
+    v = Math.max(-CONFIG.maxFlingSpeed, Math.min(CONFIG.maxFlingSpeed, v));
+
+    if (Math.abs(v) < CONFIG.minFlingSpeed) {
+      // 几乎没甩动：直接停在原地并判定结果
+      state = "idle";
+      finishSpin();
+      return;
+    }
+
+    // 有惯性：指数衰减，约 2~3 秒滑停
+    inertia = {
+      start: wheelAngle,
+      v0: v,
+      k: CONFIG.inertiaFriction,
+      t0: performance.now()
+    };
+    state = "inertia";
+    syncControls();
+    startLoop();
+  }
+
+  /* ==========================================================================
+     13. 结果层
+     ========================================================================== */
+  let resultShownAt = 0;
+
+  function showResult(winner) {
+    state = "result";
+    resultShownAt = performance.now();
+
+    els.resultSeat.textContent = padSeat(winner.seat);
+    els.resultName.textContent = winner.name;
+    els.resultAvatar.setAttribute("data-avatar-seat", String(winner.seat));
+    els.resultAvatar.setAttribute("src", avatarSrc.get(winner.seat) || "");
+    els.resultAvatar.setAttribute("alt", winner.name);
+
+    els.result.classList.add("show");
+    syncControls();
+  }
+
+  function hideResult() {
+    if (state !== "result") return;
+    els.result.classList.remove("show");
+    state = "idle";
+
+    // 「不重复抽取」时人池可能已经变了，关闭结果层后重建盘面
+    buildBitmap();
+    paint();
+    renderStats();
+    syncControls();
+  }
+
+  /* ==========================================================================
+     14. 历史记录
+     ========================================================================== */
+  function recordWin(winner) {
+    picks += 1;
+    records.unshift({
+      seq: picks,
+      seat: winner.seat,
+      name: winner.name,
+      ts: Date.now()
+    });
+    if (records.length > CONFIG.maxHistory) records.length = CONFIG.maxHistory;
+
+    if (noRepeat && drawnSeats.indexOf(winner.seat) === -1) {
+      drawnSeats.push(winner.seat);
+    }
+
+    persist();
+    renderHistory();
+    renderStats();
+  }
+
+  function fmtTime(ts) {
+    const d = new Date(ts);
+    if (isNaN(d.getTime())) return "--:--:--";
+    return pad2(d.getHours()) + ":" + pad2(d.getMinutes()) + ":" + pad2(d.getSeconds());
+  }
+
+  function renderHistory() {
+    if (records.length === 0) {
+      els.historyList.innerHTML = "";
+      els.histEmpty.hidden = false;
+    } else {
+      els.histEmpty.hidden = true;
+      const html = records.map(function (item) {
+        const st = studentBySeat(item.seat);
+        const name = st ? st.name : item.name;
+        const src = avatarSrc.get(item.seat) || "";
+        return '<li>'
+          + '<span class="seq">' + escapeHtml(String(item.seq)) + '</span>'
+          + '<img class="avatar" data-avatar-seat="' + escapeHtml(String(item.seat)) + '" src="' + escapeHtml(src) + '" alt="">'
+          + '<span class="who"><b>' + escapeHtml(name) + '</b><span>' + escapeHtml(fmtTime(item.ts)) + '</span></span>'
+          + '<span class="seatTag">' + escapeHtml(padSeat(item.seat)) + '</span>'
+          + '</li>';
+      }).join("");
+      els.historyList.innerHTML = html;
+    }
+    els.histCount.textContent = records.length + " 条";
+  }
+
+  function renderStats() {
+    const remain = getPool().length;
+    if (!STUDENTS.length) {
+      els.stat.textContent = "名单里还没有学生，请先在 STUDENTS 里添加";
+      return;
+    }
+    els.stat.textContent = noRepeat
+      ? "共 " + STUDENTS.length + " 人 · 本轮剩余 " + remain + " 人"
+      : "共 " + STUDENTS.length + " 人";
+  }
+
+  /* ==========================================================================
+     15. 控件状态同步
+     ========================================================================== */
+  function syncControls() {
+    const emptyRoster = STUDENTS.length === 0;
+    const poolEmpty = getPool().length === 0;
+    const busy = state !== "idle";
+
+    els.spin.disabled = busy || poolEmpty;
+    els.spin.textContent = emptyRoster
+      ? "请先添加学生"
+      : (poolEmpty ? "本轮已抽完" : (state === "idle" ? "开始抽取" : "转动中…"));
+
+    els.hub.textContent = emptyRoster
+      ? "空"
+      : (poolEmpty ? "重置" : (state === "idle" ? "开始" : "···"));
+
+    els.reset.hidden = !(noRepeat && drawnSeats.length > 0);
+    els.reset.disabled = busy;
+
+    els.noRepeat.checked = noRepeat;
+  }
+
+  /* ==========================================================================
+     16. 轻提示
+     ========================================================================== */
+  let toastTimer = 0;
+  function toast(msg) {
+    els.toast.textContent = msg;
+    els.toast.classList.add("show");
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () {
+      els.toast.classList.remove("show");
+    }, 1800);
+  }
+
+  /* ==========================================================================
+     17. 事件绑定
+     ========================================================================== */
+  function bindEvents() {
+    // —— 转盘：指针按下统一在容器上处理（中心按钮的事件也会冒泡到这里）——
+    els.wrap.addEventListener("pointerdown", onPointerDown, { passive: false });
+    window.addEventListener("pointermove", onPointerMove, { passive: false });
+    window.addEventListener("pointerup", onPointerUp);
+    window.addEventListener("pointercancel", onPointerUp);
+
+    // 中心按钮：点击即抽（拖动逻辑由上面的指针事件接管）
+    els.hub.addEventListener("click", function (e) {
+      e.stopPropagation();
+      if (state !== "idle") return;
+      if (getPool().length === 0) {
+        resetRound();
+        return;
+      }
+      requestSpin();
+    });
+
+    els.spin.addEventListener("click", function () {
+      if (getPool().length === 0) {
+        toast("本轮已经全部抽完，点「重置本轮」继续");
+        return;
+      }
+      requestSpin();
+    });
+
+    // 不重复抽取开关
+    els.noRepeat.addEventListener("change", function () {
+      noRepeat = els.noRepeat.checked;
+
+      if (noRepeat) {
+        // 开启时把"本轮起点之后已经抽中的人"补进已抽集合，
+        // 否则开关刚打开时，刚刚抽过的同学还会留在盘上被人再抽一次。
+        drawnSeats = Array.from(new Set(
+          records
+            .filter(function (r) { return r.seq > roundBaseSeq; })
+            .map(function (r) { return r.seat; })
+        ));
+      }
+
+      persist();
+      // 人池变了 → 盘面重建；角度保持不变，判定依旧基于真实角度
+      buildBitmap();
+      paint();
+      renderStats();
+      syncControls();
+      if (!noRepeat) {
+        toast("已关闭不重复抽取");
+      } else if (getPool().length === 0) {
+        toast("全部同学都抽过了，点「重置本轮」重新开始");
+      }
+    });
+
+    els.reset.addEventListener("click", function () {
+      if (state !== "idle") return;
+      resetRound();
+    });
+
+    // 清空历史：二次确认（按钮先变红，3.5 秒内再点一次才真的清空）
+    let clearArmed = false;
+    let clearTimer = 0;
+    els.clear.addEventListener("click", function () {
+      if (!clearArmed) {
+        clearArmed = true;
+        els.clear.classList.add("armed");
+        els.clear.textContent = "再点一次确认";
+        clearTimeout(clearTimer);
+        clearTimer = setTimeout(function () {
+          clearArmed = false;
+          els.clear.classList.remove("armed");
+          els.clear.textContent = "清空历史";
+        }, 3500);
+        return;
+      }
+      clearTimeout(clearTimer);
+      clearArmed = false;
+      els.clear.classList.remove("armed");
+      els.clear.textContent = "清空历史";
+      records = [];
+      persist();
+      renderHistory();
+      toast("历史已清空");
+    });
+
+    // 结果层：点任意位置或按钮关闭
+    els.result.addEventListener("click", function () {
+      if (state !== "result") return;
+      // 刚弹出的一小段时间内忽略点击，避免旋转结束的余势误触
+      if (performance.now() - resultShownAt < CONFIG.resultClickGuardMs) return;
+      hideResult();
+    });
+
+    // 键盘：Esc 关结果，空格/回车抽一次
+    window.addEventListener("keydown", function (e) {
+      if (e.key === "Escape") {
+        hideResult();
+        return;
+      }
+      if (e.key !== " " && e.key !== "Enter") return;
+      const tag = (e.target && e.target.tagName ? e.target.tagName : "").toLowerCase();
+      if (tag === "input" || tag === "button" || tag === "textarea") return;
+      if (state !== "idle") return;
+      e.preventDefault();
+      if (getPool().length === 0) {
+        toast("本轮已经全部抽完，点「重置本轮」继续");
+        return;
+      }
+      requestSpin();
+    });
+
+    // 尺寸变化
+    if (window.ResizeObserver) {
+      const ro = new ResizeObserver(function () { layoutCanvas(); });
+      ro.observe(els.wrap);
+    }
+    window.addEventListener("resize", layoutCanvas);
+    window.addEventListener("orientationchange", function () {
+      setTimeout(layoutCanvas, 220);
+    });
+  }
+
+  function resetRound() {
+    drawnSeats = [];
+    roundBaseSeq = picks;      // 本轮从此刻重新计数，历史记录不会被清掉
+    persist();
+    buildBitmap();
+    paint();
+    renderStats();
+    syncControls();
+    toast("已重置，所有同学重新回到转盘");
+  }
+
+  /* ==========================================================================
+     18. 启动
+     ========================================================================== */
+  function init() {
+    loadState();
+    initAvatars();
+    bindEvents();
+    renderHistory();
+    renderStats();
+    syncControls();
+
+    // 首次布局（等一帧，确保 CSS 的 vw/vh 已经算好）
+    layoutCanvas();
+    requestAnimationFrame(layoutCanvas);
+
+    if (STUDENTS.length === 0) {
+      toast("请先在 STUDENTS 数组里填入学生名单");
+    }
+  }
+
+  init();
+})();
+</script>
+</body>
+</html>
